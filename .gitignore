@@ -1,1 +1,70 @@
 .qodo
+.trunk
+.venv
+
+
+# Operating system files
+.DS_Store
+Thumbs.db
+
+# IDE specific files
+.vscode/
+.idea/
+
+# Build outputs
+/build/
+/dist/
+/bin/
+/target/
+/out/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Version control
+.git/
+.svn/
+.hg/
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+*.bak
+*.swp
+*.swo
+
+# Node.js packages
+node_modules/
+
+# Python packages
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Database files
+*.db
+*.sqlite3
+*.sqlite
+
+# OS generated files
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Windows files
+*.dll
+*.exe
+*.ocx
+
+# macOS files
+.AppleDouble
+.LSOverride
+
+# Linux files
+.core
+.hist
+.svn
