@@ -48,6 +48,7 @@ from constants import (
     LOG_FORMAT,
     AWS_CONN_ID,
     AWS_REGION,
+    GLUE_DEFAULT_ARGUMENTS,
 )
 
 # Configure logging
@@ -267,20 +268,38 @@ def music_streaming_pipeline():
 
         with log_duration():
             try:
+                # Create a unique task_id for each job run
+                task_id = (
+                    f"glue_job_{job_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                )
+
+                # Ensure script_args values are strings
+                script_args = {
+                    k: str(v)
+                    for k, v in job_params["script_args"].items()
+                    if v is not None
+                }
+
+                # Combine with default arguments
+                script_args.update(GLUE_DEFAULT_ARGUMENTS)
+
                 glue_job = GlueJobOperator(
-                    task_id=f"glue_job_{job_name}",
+                    task_id=task_id,
                     job_name=job_name,
                     script_location=job_params["script_location"],
-                    script_args=job_params["script_args"],
+                    script_args=script_args,
                     aws_conn_id=AWS_CONN_ID,
                     region_name=AWS_REGION,
                     wait_for_completion=True,
-                    iam_role_name="AWSGlueServiceRole-MusicStreaming",
-                    dag=dag,
+                    create_job_kwargs={
+                        "GlueVersion": "3.0",
+                        "NumberOfWorkers": 2,
+                        "WorkerType": "G.1X",
+                    },
                 )
 
-                logger.info(f"Executing Glue job: {job_name}")
-                glue_job.execute(context={})
+                logger.info(f"Executing Glue job: {job_name} with args: {script_args}")
+                glue_job.execute(context={"task": glue_job})
 
                 output_path = job_params["script_args"].get("--output_path", "")
                 logger.info(
@@ -323,7 +342,3 @@ def music_streaming_pipeline():
 
 # Create the DAG
 dag = music_streaming_pipeline()
-
-
-# Create the DAG
-# dag = music_streaming_pipeline()
