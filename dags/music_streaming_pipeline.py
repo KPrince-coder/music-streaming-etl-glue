@@ -46,6 +46,8 @@ from constants import (
     SENSOR_POKE_INTERVAL,
     SENSOR_TIMEOUT,
     LOG_FORMAT,
+    AWS_CONN_ID,
+    AWS_REGION,
 )
 
 # Configure logging
@@ -92,7 +94,12 @@ def music_streaming_pipeline():
     setup_logger()
     logger.info("Initializing music streaming pipeline")
 
-    @task.sensor(poke_interval=SENSOR_POKE_INTERVAL, timeout=SENSOR_TIMEOUT)
+    @task.sensor(
+        poke_interval=SENSOR_POKE_INTERVAL,
+        timeout=SENSOR_TIMEOUT,
+        mode="poke",  # This ensures the task runs periodically
+        soft_fail=True,  # This allows the task to exit gracefully when timeout is reached
+    )
     def check_for_data(bucket: str, prefix: str) -> str:
         """
         Check for new data files in S3
@@ -101,16 +108,44 @@ def music_streaming_pipeline():
         logger.info(f"Checking for new data in s3://{bucket}/{prefix}")
 
         with log_duration():
-            s3_hook = S3Hook()
-            files = s3_hook.list_keys(bucket=bucket, prefix=prefix)
+            s3_hook = S3Hook(aws_conn_id=AWS_CONN_ID)
 
-            if not files:
-                logger.warning(f"No files found in s3://{bucket}/{prefix}")
+            # List all CSV files in the directory
+            files = s3_hook.list_keys(
+                bucket_name=bucket,
+                prefix=prefix,
+                delimiter="/",  # This ensures we only get files in the immediate directory
+            )
+
+            # Filter for CSV files and sort them
+            csv_files = [f for f in files if f and f.lower().endswith(".csv")]
+            if not csv_files:
+                logger.warning(f"No CSV files found in s3://{bucket}/{prefix}")
                 return ""
 
-            found_file = f"s3://{bucket}/{files[0]}"
-            logger.info(f"Found new data file: {found_file}")
-            return found_file
+            # Sort files by name to process them in order
+            csv_files.sort()
+
+            # Get the first file that hasn't been processed yet
+            for file_key in csv_files:
+                # Check if file has already been processed by looking in archived folder
+                archived_prefix = f"{S3_ARCHIVED_PREFIX}"
+                archived_files = s3_hook.list_keys(
+                    bucket_name=bucket, prefix=archived_prefix
+                )
+
+                file_name = file_key.split("/")[-1]
+                already_processed = any(
+                    file_name in archived_key for archived_key in (archived_files or [])
+                )
+
+                if not already_processed:
+                    found_file = f"s3://{bucket}/{file_key}"
+                    logger.info(f"Found new data file to process: {found_file}")
+                    return found_file
+
+            logger.info("All existing files have been processed")
+            return ""
 
     @task
     def prepare_validation_job(input_path: str) -> Dict:
@@ -174,24 +209,46 @@ def music_streaming_pipeline():
         """
         Archive processed files to a different S3 location
         """
+        if not input_path:
+            logger.warning("No input path provided for archival")
+            return False
+
         logger.info(f"Starting file archival process for: {input_path}")
 
         with log_duration():
             try:
-                s3_hook = S3Hook()
-                source_key = input_path.split(f"{S3_BUCKET}/")[1]
-                dest_key = f"{S3_ARCHIVED_PREFIX}{datetime.now().strftime('%Y%m%d_%H%M%S')}/{source_key.split('/')[-1]}"
+                s3_hook = S3Hook(aws_conn_id=AWS_CONN_ID)
+
+                # Extract the source key from the full S3 path
+                if not input_path.startswith(f"s3://{S3_BUCKET}/"):
+                    raise ValueError(f"Invalid input path format: {input_path}")
+
+                source_key = input_path.replace(f"s3://{S3_BUCKET}/", "")
+
+                # Create timestamp-based archive path
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                dest_key = (
+                    f"{S3_ARCHIVED_PREFIX}{timestamp}/{source_key.split('/')[-1]}"
+                )
+
+                # Ensure archive directory exists
+                s3_hook.load_string(
+                    string_data="",
+                    key=f"{S3_ARCHIVED_PREFIX}.keep",
+                    bucket_name=S3_BUCKET,
+                    replace=True,
+                )
 
                 logger.info(f"Copying file from {source_key} to {dest_key}")
                 s3_hook.copy_object(
-                    source_bucket_key=source_key,
-                    dest_bucket_key=dest_key,
                     source_bucket_name=S3_BUCKET,
                     dest_bucket_name=S3_BUCKET,
+                    source_key=source_key,
+                    dest_key=dest_key,
                 )
 
                 logger.info(f"Deleting original file: {source_key}")
-                s3_hook.delete_objects(bucket=S3_BUCKET, keys=[source_key])
+                s3_hook.delete_objects(bucket_name=S3_BUCKET, keys=[source_key])
 
                 logger.info("File archival completed successfully")
                 return True
@@ -215,6 +272,11 @@ def music_streaming_pipeline():
                     job_name=job_name,
                     script_location=job_params["script_location"],
                     script_args=job_params["script_args"],
+                    aws_conn_id=AWS_CONN_ID,
+                    region_name=AWS_REGION,
+                    wait_for_completion=True,
+                    iam_role_name="AWSGlueServiceRole-MusicStreaming",
+                    dag=dag,
                 )
 
                 logger.info(f"Executing Glue job: {job_name}")
@@ -236,22 +298,27 @@ def music_streaming_pipeline():
     logger.info("Setting up pipeline task flow")
 
     input_file = check_for_data(bucket=S3_BUCKET, prefix=S3_RAW_PREFIX)
-    logger.info(f"Pipeline triggered for input file: {input_file}")
 
-    validation_params = prepare_validation_job(input_file)
-    validated_path = run_glue_job(validation_params)
-    logger.info(f"Data validation completed. Output: {validated_path}")
+    # Only proceed if we have a file to process
+    if input_file:
+        logger.info(f"Pipeline triggered for input file: {input_file}")
 
-    kpi_params = prepare_kpi_job(validated_path)
-    processed_path = run_glue_job(kpi_params)
-    logger.info(f"KPI computation completed. Output: {processed_path}")
+        validation_params = prepare_validation_job(input_file)
+        validated_path = run_glue_job(validation_params)
+        logger.info(f"Data validation completed. Output: {validated_path}")
 
-    dynamodb_params = prepare_dynamodb_job(processed_path)
-    run_glue_job(dynamodb_params)
-    logger.info("DynamoDB load completed")
+        kpi_params = prepare_kpi_job(validated_path)
+        processed_path = run_glue_job(kpi_params)
+        logger.info(f"KPI computation completed. Output: {processed_path}")
 
-    archive_files(input_file)
-    logger.info("Pipeline execution completed successfully")
+        dynamodb_params = prepare_dynamodb_job(processed_path)
+        run_glue_job(dynamodb_params)
+        logger.info("DynamoDB load completed")
+
+        archive_files(input_file)
+        logger.info("Pipeline execution completed successfully")
+    else:
+        logger.info("No new files to process. Ending pipeline execution.")
 
 
 # Create the DAG

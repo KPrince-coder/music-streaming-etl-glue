@@ -4,9 +4,13 @@ Constants for the music streaming pipeline
 
 from datetime import timedelta
 
+# AWS Configuration
+AWS_CONN_ID = "aws_conn"
+AWS_REGION = "eu-west-1"
+
 # S3 Configuration
 S3_BUCKET = "music-streaming-analyses-bucket"
-S3_RAW_PREFIX = "data/streams/"
+S3_RAW_PREFIX = "streams/"
 S3_VALIDATED_PREFIX = "validated/"
 S3_PROCESSED_PREFIX = "processed/"
 S3_ARCHIVED_PREFIX = "archived/"
