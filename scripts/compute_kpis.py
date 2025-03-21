@@ -33,6 +33,7 @@ REQUIRED_ARGS = [
 # KPI Configuration
 TOP_SONGS_PER_GENRE = 3
 TOP_GENRES_PER_DAY = 5
+S3_PREFIX = "s3://"
 
 
 def clean_s3_path(path: str) -> str:
@@ -46,11 +47,11 @@ def clean_s3_path(path: str) -> str:
 
         # Fix malformed s3:/ prefix
         if path.startswith("s3:/") and not path.startswith("s3://"):
-            path = "s3://" + path[4:]
+            path = S3_PREFIX + path[4:]
 
         # Add s3:// prefix if missing
-        if not path.startswith("s3://"):
-            path = "s3://" + path.lstrip("/")
+        if not path.startswith(S3_PREFIX):
+            path = S3_PREFIX + path.lstrip("/")
 
         # Parse the URL
         parsed = urlparse(path)
@@ -147,7 +148,7 @@ def read_parquet_safely(spark: SparkSession, path: str, name: str) -> DataFrame:
     except Exception as e:
         error_msg = f"Failed to read {name}: {str(e)}"
         logger.error(error_msg)
-        raise Exception(error_msg) from e
+        raise FileNotFoundError(error_msg) from e
 
 
 def compute_user_kpis(df: DataFrame) -> DataFrame:
@@ -257,7 +258,7 @@ def write_parquet_safely(df: DataFrame, path: str, name: str):
         df.write.mode("overwrite").parquet(clean_path)
         logger.info(f"Successfully wrote {name}")
     except Exception as e:
-        raise Exception(f"Failed to write {name} to {clean_path}: {str(e)}") from e
+        raise IOError(f"Failed to write {name} to {clean_path}: {str(e)}") from e
 
 
 def main():
