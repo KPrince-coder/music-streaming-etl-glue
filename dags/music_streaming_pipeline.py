@@ -6,11 +6,12 @@ and stores results in DynamoDB for real-time analytics.
 """
 
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List
 import logging
 import hashlib
 import json
 import os
+import time
 from airflow.utils.dates import days_ago
 from airflow.decorators import dag, task
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
@@ -32,12 +33,10 @@ from constants import (
     S3_KEY_NOT_FOUND_ERROR,
     S3_VALIDATED_PREFIX,
     S3_PROCESSED_PREFIX,
-    S3_ARCHIVED_PREFIX,
     S3_SCRIPTS_PREFIX,
     REQUIRED_S3_DIRS,
     GLUE_SCRIPT_VALIDATION,
     GLUE_SCRIPT_KPI,
-    GLUE_SCRIPT_DYNAMODB,
     DAG_ID,
     DAG_DESCRIPTION,
     DAG_TAGS,
@@ -192,6 +191,42 @@ def music_streaming_pipeline():
                 logger.info(f"Deleting existing script: {script_key}")
                 s3_hook.delete_objects(bucket=S3_BUCKET, keys=[script_key])
 
+    def upload_script(
+        s3_hook: S3Hook, script_name: str, local_path: str, bucket: str
+    ) -> bool:
+        """Upload a script to S3 and verify its existence"""
+        try:
+            s3_key = f"{S3_SCRIPTS_PREFIX}{script_name}"
+            logger.info(f"Reading local script: {local_path}")
+
+            with open(local_path, "r") as f:
+                script_content = f.read()
+
+            logger.info(f"Uploading script to: s3://{bucket}/{s3_key}")
+            s3_hook.load_string(
+                string_data=script_content,
+                key=s3_key,
+                bucket_name=bucket,
+                replace=True,
+            )
+
+            # Verify upload
+            if not s3_hook.check_for_key(key=s3_key, bucket_name=bucket):
+                logger.error(f"Failed to verify uploaded script: {s3_key}")
+                return False
+
+            uploaded_content = s3_hook.read_key(key=s3_key, bucket_name=bucket)
+            if uploaded_content.strip() != script_content.strip():
+                logger.error(f"Content verification failed for {s3_key}")
+                return False
+
+            logger.info(f"Successfully uploaded and verified: {s3_key}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Error uploading script {script_name}: {str(e)}")
+            return False
+
     @task
     def init_s3_structure():
         """Initialize S3 bucket structure"""
@@ -199,34 +234,23 @@ def music_streaming_pipeline():
         logger.info(f"Initializing S3 structure in bucket: {S3_BUCKET}")
 
         initialize_s3_structure(s3_hook, S3_BUCKET, REQUIRED_S3_DIRS)
-        initialize_json_files(s3_hook, S3_BUCKET)  # Add this line
+        initialize_json_files(s3_hook, S3_BUCKET)
 
-        # Upload actual Glue scripts from local directory to S3
+        # Upload Glue scripts
         scripts = {
             "validate_data.py": "validate_data.py",
             "compute_kpis.py": "compute_kpis.py",
             "load_dynamodb.py": "load_dynamodb.py",
         }
 
+        upload_failures = []
         for script_name, local_name in scripts.items():
-            s3_key = f"{S3_SCRIPTS_PREFIX}{script_name}"
             local_path = f"/usr/local/airflow/scripts/{local_name}"
+            if not upload_script(s3_hook, script_name, local_path, S3_BUCKET):
+                upload_failures.append(script_name)
 
-            logger.info(f"Reading local script: {local_path}")
-            try:
-                with open(local_path, "r") as f:
-                    script_content = f.read()
-
-                logger.info(f"Uploading script to: s3://{S3_BUCKET}/{s3_key}")
-                s3_hook.load_string(
-                    string_data=script_content,
-                    key=s3_key,
-                    bucket_name=S3_BUCKET,
-                    replace=True,
-                )
-            except Exception as e:
-                logger.error(f"Failed to upload script {script_name}: {str(e)}")
-                raise
+        if upload_failures:
+            raise AirflowException(f"Failed to upload scripts: {upload_failures}")
 
     @task
     def verify_glue_scripts():
@@ -363,6 +387,7 @@ def music_streaming_pipeline():
     ) -> Dict[str, Any]:
         """Prepare data processing parameters"""
         if not stream_files:
+            logger.info("No stream files to process")
             return None
 
         # Clean up stream files paths to avoid prefix duplication
@@ -374,6 +399,10 @@ def music_streaming_pipeline():
             stream_files_paths.append(full_path)
             logger.info(f"Prepared stream file path: {full_path}")
 
+        # Ensure output path is properly formatted
+        output_path = f"s3://{S3_BUCKET}/{S3_VALIDATED_PREFIX}".rstrip("/")
+        logger.info(f"Using output path: {output_path}")
+
         # Prepare job parameters
         job_params = {
             "job_name": GLUE_JOB_VALIDATION,
@@ -384,7 +413,7 @@ def music_streaming_pipeline():
                 "--stream_files": ",".join(stream_files_paths),
                 "--songs_file": f"s3://{S3_BUCKET}/songs/songs.csv",
                 "--users_file": f"s3://{S3_BUCKET}/users/users.csv",
-                "--output_path": f"s3://{S3_BUCKET}/{S3_VALIDATED_PREFIX}",
+                "--output_path": output_path,
                 "--process_songs": str(ref_updates["songs"]).lower(),
                 "--process_users": str(ref_updates["users"]).lower(),
             },
@@ -441,39 +470,110 @@ def music_streaming_pipeline():
                 f"Failed to update processed files record: {str(e)}"
             ) from e
 
+    def clean_s3_path(path: str) -> str:
+        """Clean S3 path by removing extra slashes and ensuring proper format"""
+        if not path:
+            return ""
+        # Remove multiple consecutive slashes except after scheme
+        parts = path.split("://", 1)
+        if len(parts) > 1:
+            return f"{parts[0]}://{parts[1].replace('//', '/')}"
+        return path.replace("//", "/")
+
     @task
     def prepare_kpi_job(validated_path: str | None) -> Dict | None:
         """Prepare KPI computation job parameters"""
         if not validated_path:
-            logger.info("No validated path provided - skipping KPI computation")
             return None
 
-        logger.info(f"Preparing KPI job for validated data: {validated_path}")
-        output_path = f"s3://{S3_BUCKET}/{S3_PROCESSED_PREFIX}"
+        try:
+            logger.info(f"Preparing KPI job for validated data: {validated_path}")
+            s3_hook = S3Hook(aws_conn_id=AWS_CONN_ID)
 
-        # Verify input files exist
-        s3_hook = S3Hook(aws_conn_id=AWS_CONN_ID)
-        required_files = ["streams.parquet", "songs.parquet", "users.parquet"]
-
-        for file in required_files:
-            file_path = f"{validated_path}/{file}"
-            if not s3_hook.check_for_key(file_path.replace(f"s3://{S3_BUCKET}/", "")):
-                logger.error(f"Required file not found: {file_path}")
+            # Verify KPI script exists
+            script_key = f"{S3_SCRIPTS_PREFIX}compute_kpis.py"
+            if not s3_hook.check_for_key(key=script_key, bucket_name=S3_BUCKET):
+                logger.error(f"KPI script not found: {script_key}")
                 return None
 
-        return {
-            "job_name": GLUE_JOB_KPI,  # Use the constant instead of hardcoded string
-            "script_location": GLUE_SCRIPT_KPI,
-            "script_args": {
-                "--input_path": validated_path,  # Make sure this is included
-                "--output_path": output_path,
-                "--job_name": GLUE_JOB_KPI,  # Use the constant here as well
-                "--streams_table": f"{validated_path}/streams.parquet",
-                "--songs_table": f"{validated_path}/songs.parquet",
-                "--users_table": f"{validated_path}/users.parquet",
-                "--execution_date": "{{ ds }}",
-            },
-        }
+            # Clean paths
+            cleaned_validated_path = clean_s3_path(validated_path)
+            output_path = clean_s3_path(f"s3://{S3_BUCKET}/{S3_PROCESSED_PREFIX}")
+
+            # Check for required files
+            required_files = {
+                "streams.parquet": True,  # True means multiple files are allowed
+                "songs.parquet": False,  # False means single file expected
+                "users.parquet": False,
+            }
+            missing_files = []
+            file_paths = {}
+
+            for file, allow_multiple in required_files.items():
+                file_path = cleaned_validated_path.replace(f"s3://{S3_BUCKET}/", "")
+                file_key = f"{file_path}/{file}"
+
+                logger.info(f"Checking for file: {file_key}")
+
+                matching_keys = s3_hook.list_keys(
+                    bucket_name=S3_BUCKET, prefix=file_key
+                )
+
+                if not matching_keys:
+                    missing_files.append(file)
+                    logger.warning(f"No files found for: {file_key}")
+                    continue
+
+                # Filter out directory entries
+                valid_files = [k for k in matching_keys if not k.endswith("/")]
+
+                if allow_multiple:
+                    if valid_files:
+                        logger.info(
+                            f"Found {len(valid_files)} valid files for {file}: {valid_files}"
+                        )
+                        file_paths[file] = valid_files
+                    else:
+                        missing_files.append(file)
+                        logger.warning(f"No valid files found for {file}")
+                else:
+                    if len(valid_files) == 1:
+                        logger.info(f"Found valid file for {file}: {valid_files[0]}")
+                        file_paths[file] = valid_files[0]
+                    else:
+                        missing_files.append(file)
+                        logger.warning(
+                            f"Expected single file for {file}, found {len(valid_files)}"
+                        )
+
+            if missing_files:
+                logger.error(f"Missing or invalid required files: {missing_files}")
+                return None
+
+            # For streams, combine all paths with comma
+            streams_table = ",".join(
+                [f"s3://{S3_BUCKET}/{path}" for path in file_paths["streams.parquet"]]
+            )
+
+            # Prepare job parameters
+            return {
+                "job_name": GLUE_JOB_KPI,
+                "script_location": GLUE_SCRIPT_KPI,
+                "script_args": {
+                    "--input_path": cleaned_validated_path,
+                    "--output_path": output_path,
+                    "--job_name": GLUE_JOB_KPI,
+                    "--streams_table": streams_table,
+                    "--songs_table": f"s3://{S3_BUCKET}/{file_paths['songs.parquet']}",
+                    "--users_table": f"s3://{S3_BUCKET}/{file_paths['users.parquet']}",
+                    "--execution_date": "{{ ds }}",
+                },
+            }
+
+        except Exception as e:
+            logger.error(f"Error preparing KPI job: {str(e)}")
+            logger.exception("Full traceback:")
+            return None
 
     # @task
     # def prepare_dynamodb_job(kpi_path: str | None) -> Dict | None:
@@ -496,62 +596,78 @@ def music_streaming_pipeline():
     def run_glue_job(job_params: Dict | None) -> str | None:
         """Execute Glue job and return output path"""
         if not job_params:
+            logger.info("No job parameters provided - skipping job execution")
             return None
 
-        job_name = job_params["job_name"]
-        script_location = job_params["script_location"]
-        script_args = job_params["script_args"]
-
-        logger.info(f"Starting Glue job: {job_name}")
-        logger.info(f"Script location: {script_location}")
-        logger.info(f"Script args: {script_args}")
-
         try:
+            job_name = job_params["job_name"]
+            script_location = job_params["script_location"]
+            script_args = job_params.get("script_args", {})
+            output_path = script_args.get("--output_path")
+
+            logger.info(f"Starting Glue job execution: {job_name}")
+            logger.info(f"Script location: {script_location}")
+            logger.info(f"Script arguments: {json.dumps(script_args, indent=2)}")
+
             glue_job = GlueJobOperator(
                 task_id=f"glue_job_{job_name}",
                 job_name=job_name,
                 script_location=script_location,
-                script_args=script_args,
                 aws_conn_id=AWS_CONN_ID,
                 region_name=AWS_REGION,
-                wait_for_completion=True,
                 iam_role_name=AWS_GLUE_IAM_ROLE,
+                script_args=script_args,
+                s3_bucket=S3_BUCKET,
                 create_job_kwargs={
                     "GlueVersion": "3.0",
                     "WorkerType": GLUE_WORKER_TYPE,
                     "NumberOfWorkers": GLUE_NUM_WORKERS,
                     "Timeout": GLUE_TIMEOUT,
+                    # Removed MaxConcurrentRuns as it's not a valid parameter
                     "ExecutionProperty": {
                         "MaxConcurrentRuns": GLUE_MAX_CONCURRENT_RUNS
                     },
                 },
-                dag=None,
+                wait_for_completion=True,
             )
 
+            # Execute the job
             glue_job.execute(context={})
+            logger.info(f"Glue job {job_name} completed successfully")
 
-            # Verify the output path exists
-            output_path = script_args.get("--output_path")
-            if output_path:
-                s3_hook = S3Hook(aws_conn_id=AWS_CONN_ID)
-                bucket = S3_BUCKET
-                prefix = output_path.replace(f"s3://{bucket}/", "")
+            if not output_path:
+                logger.warning("No output path specified in job parameters")
+                return None
 
-                if not s3_hook.check_for_prefix(
-                    bucket_name=bucket, prefix=prefix, delimiter="/"
+            # Verify output directory exists
+            s3_hook = S3Hook(aws_conn_id=AWS_CONN_ID)
+            max_retries = 5
+            retry_delay = 30  # seconds
+
+            for attempt in range(max_retries):
+                if s3_hook.check_for_prefix(
+                    bucket_name=S3_BUCKET,
+                    prefix=output_path.replace(f"s3://{S3_BUCKET}/", "").rstrip("/"),
+                    delimiter="/",
                 ):
-                    logger.error(
-                        f"Output path not found after job completion: {output_path}"
-                    )
-                    return None
+                    logger.info(f"Output verified: {output_path}")
+                    return output_path
 
-                logger.info(f"Successfully verified output path: {output_path}")
-                return output_path
+                if attempt < max_retries - 1:
+                    logger.info(
+                        f"Output not ready, retrying in {retry_delay} seconds..."
+                    )
+                    time.sleep(retry_delay)
+
+            logger.error(
+                f"Output not found after {max_retries} attempts: {output_path}"
+            )
             return None
 
         except Exception as e:
             logger.error(f"Failed to execute Glue job {job_name}: {str(e)}")
-            raise
+            logger.exception("Full traceback:")
+            raise AirflowException(f"Glue job {job_name} failed: {str(e)}") from e
 
     # @task
     # def archive_files(input_path: str | None) -> bool:
@@ -624,3 +740,7 @@ def music_streaming_pipeline():
 
 # Create the DAG
 dag = music_streaming_pipeline()
+
+
+# Create the DAG
+# dag = music_streaming_pipeline()
