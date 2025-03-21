@@ -26,19 +26,6 @@ GLUE_SCRIPT_VALIDATION = f"s3://{S3_BUCKET}/{S3_SCRIPTS_PREFIX}validate_data.py"
 GLUE_SCRIPT_KPI = f"s3://{S3_BUCKET}/{S3_SCRIPTS_PREFIX}compute_kpis.py"
 GLUE_SCRIPT_DYNAMODB = f"s3://{S3_BUCKET}/{S3_SCRIPTS_PREFIX}load_dynamodb.py"
 
-# Glue Configuration
-GLUE_WORKER_TYPE = "G.1X"
-GLUE_NUMBER_OF_WORKERS = 2
-GLUE_TIMEOUT_MINUTES = 60
-GLUE_DEFAULT_ARGUMENTS = {
-    "--enable-metrics": "true",
-    "--job-language": "python",
-    "--TempDir": "s3://aws-glue-temporary-{region}/temporary/",
-    "--enable-continuous-cloudwatch-log": "true",
-}
-GLUE_MAX_CONCURRENT_RUNS = 3
-GLUE_MAX_RETRIES = 0
-
 # DynamoDB Configuration
 DYNAMODB_TABLE = "music_streaming_kpis"
 

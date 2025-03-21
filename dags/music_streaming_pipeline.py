@@ -11,12 +11,15 @@ The pipeline handles:
 4. File archival
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict
 import json
 import logging
 from contextlib import contextmanager
-
+from botocore.exceptions import ClientError
+import time
+import random
+import boto3
 
 from airflow.utils.dates import days_ago
 from airflow.decorators import dag, task
@@ -48,7 +51,6 @@ from constants import (
     LOG_FORMAT,
     AWS_CONN_ID,
     AWS_REGION,
-    GLUE_DEFAULT_ARGUMENTS,
 )
 
 # Configure logging
@@ -98,8 +100,8 @@ def music_streaming_pipeline():
     @task.sensor(
         poke_interval=SENSOR_POKE_INTERVAL,
         timeout=SENSOR_TIMEOUT,
-        mode="poke",  # This ensures the task runs periodically
-        soft_fail=True,  # This allows the task to exit gracefully when timeout is reached
+        mode="poke",
+        soft_fail=False,  # Changed to False to fail the DAG when no files are found
     )
     def check_for_data(bucket: str, prefix: str) -> str:
         """
@@ -108,51 +110,44 @@ def music_streaming_pipeline():
         """
         logger.info(f"Checking for new data in s3://{bucket}/{prefix}")
 
-        with log_duration():
-            s3_hook = S3Hook(aws_conn_id=AWS_CONN_ID)
+        s3_hook = S3Hook(aws_conn_id=AWS_CONN_ID)
 
-            # List all CSV files in the directory
-            files = s3_hook.list_keys(
-                bucket_name=bucket,
-                prefix=prefix,
-                delimiter="/",  # This ensures we only get files in the immediate directory
-            )
+        try:
+            files = s3_hook.list_keys(bucket_name=bucket, prefix=prefix)
 
-            # Filter for CSV files and sort them
-            csv_files = [f for f in files if f and f.lower().endswith(".csv")]
-            if not csv_files:
-                logger.warning(f"No CSV files found in s3://{bucket}/{prefix}")
-                return ""
+            if not files:
+                logger.info(f"No files found in s3://{bucket}/{prefix}")
+                return None  # Return None instead of empty string
 
-            # Sort files by name to process them in order
-            csv_files.sort()
+            for file_key in files:
+                if not file_key.endswith("/"):  # Skip directories
+                    already_processed = s3_hook.check_for_key(
+                        f"{S3_ARCHIVED_PREFIX}{file_key.split('/')[-1]}",
+                        bucket_name=bucket,
+                    )
 
-            # Get the first file that hasn't been processed yet
-            for file_key in csv_files:
-                # Check if file has already been processed by looking in archived folder
-                archived_prefix = f"{S3_ARCHIVED_PREFIX}"
-                archived_files = s3_hook.list_keys(
-                    bucket_name=bucket, prefix=archived_prefix
-                )
-
-                file_name = file_key.split("/")[-1]
-                already_processed = any(
-                    file_name in archived_key for archived_key in (archived_files or [])
-                )
-
-                if not already_processed:
-                    found_file = f"s3://{bucket}/{file_key}"
-                    logger.info(f"Found new data file to process: {found_file}")
-                    return found_file
+                    if not already_processed:
+                        found_file = f"s3://{bucket}/{file_key}"
+                        logger.info(f"Found new data file to process: {found_file}")
+                        return found_file
 
             logger.info("All existing files have been processed")
-            return ""
+            return None  # Return None instead of empty string
+
+        except Exception as e:
+            logger.error(f"Error checking for data: {str(e)}", exc_info=True)
+            raise
 
     @task
-    def prepare_validation_job(input_path: str) -> Dict:
+    def prepare_validation_job(input_path: str | None) -> Dict | None:
         """
         Prepare parameters for Glue validation job
+        Returns None if no input path is provided
         """
+        if not input_path:
+            logger.info("No input path provided - skipping validation job")
+            return None
+
         logger.info(f"Preparing validation job for input: {input_path}")
 
         job_params = {
@@ -172,6 +167,9 @@ def music_streaming_pipeline():
         """
         Prepare parameters for KPI computation job
         """
+        if not validated_path:
+            raise ValueError("No validated path provided for KPI job")
+
         logger.info(f"Preparing KPI computation job for path: {validated_path}")
 
         job_params = {
@@ -191,6 +189,9 @@ def music_streaming_pipeline():
         """
         Prepare parameters for DynamoDB load job
         """
+        if not processed_path:
+            raise ValueError("No processed path provided for DynamoDB job")
+
         logger.info(f"Preparing DynamoDB load job for path: {processed_path}")
 
         job_params = {
@@ -206,12 +207,12 @@ def music_streaming_pipeline():
         return job_params
 
     @task
-    def archive_files(input_path: str) -> bool:
+    def archive_files(input_path: str | None) -> bool:
         """
         Archive processed files to a different S3 location
         """
         if not input_path:
-            logger.warning("No input path provided for archival")
+            logger.info("No input path provided - skipping archival")
             return False
 
         logger.info(f"Starting file archival process for: {input_path}")
@@ -258,52 +259,94 @@ def music_streaming_pipeline():
                 logger.error(f"Error during file archival: {str(e)}", exc_info=True)
                 raise
 
-    @task
-    def run_glue_job(job_params: Dict) -> str:
+    @task(
+        retries=3,  # Increase retries for this specific task
+        retry_delay=timedelta(seconds=30),  # Add delay between retries
+        retry_exponential_backoff=True,  # Use exponential backoff
+        max_retry_delay=timedelta(minutes=10),
+    )
+    def run_glue_job(job_params: Dict | None) -> str | None:
         """
         Execute a Glue job and return the output path
+        Returns None if no job parameters are provided
         """
+        if not job_params:
+            logger.info("No job parameters provided - skipping Glue job")
+            return None
+
         job_name = job_params["job_name"]
         logger.info(f"Starting Glue job execution: {job_name}")
 
         with log_duration():
             try:
-                # Create a unique task_id for each job run
                 task_id = (
                     f"glue_job_{job_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
                 )
 
-                # Ensure script_args values are strings
-                script_args = {
-                    k: str(v)
-                    for k, v in job_params["script_args"].items()
-                    if v is not None
-                }
+                # Initialize Glue client
+                glue_client = boto3.client("glue", region_name=AWS_REGION)
 
-                # Combine with default arguments
-                script_args.update(GLUE_DEFAULT_ARGUMENTS)
+                max_retries = 3
+                retry_count = 0
+                base_delay = 30  # seconds
 
-                glue_job = GlueJobOperator(
-                    task_id=task_id,
-                    job_name=job_name,
-                    script_location=job_params["script_location"],
-                    script_args=script_args,
-                    aws_conn_id=AWS_CONN_ID,
-                    region_name=AWS_REGION,
-                    wait_for_completion=True,
-                    create_job_kwargs={
-                        "GlueVersion": "3.0",
-                        "NumberOfWorkers": 2,
-                        "WorkerType": "G.1X",
-                    },
-                )
+                while retry_count < max_retries:
+                    try:
+                        glue_job = GlueJobOperator(
+                            task_id=task_id,
+                            job_name=job_name,
+                            script_location=job_params["script_location"],
+                            script_args=job_params["script_args"],
+                            aws_conn_id=AWS_CONN_ID,
+                            region_name=AWS_REGION,
+                            wait_for_completion=True,
+                            verbose=True,
+                            create_job_kwargs={
+                                "GlueVersion": "3.0",
+                                "NumberOfWorkers": 2,
+                                "WorkerType": "G.1X",
+                                "MaxRetries": 0,
+                                "Timeout": 60,
+                                "MaxConcurrentRuns": 1,
+                                "DefaultArguments": {
+                                    "--enable-auto-scaling": "true",
+                                    "--job-language": "python",
+                                    "--continuous-log-logGroup": f"/aws-glue/jobs/{job_name}",
+                                    "--enable-glue-datacatalog": "true",
+                                },
+                            },
+                        )
 
-                logger.info(f"Executing Glue job: {job_name} with args: {script_args}")
-                glue_job.execute(context={"task": glue_job})
+                        glue_job.execute(context={"task": glue_job})
+                        break  # If successful, exit the retry loop
+
+                    except ClientError as e:
+                        if (
+                            e.response["Error"]["Code"]
+                            == "ConcurrentRunsExceededException"
+                        ):
+                            if retry_count < max_retries - 1:
+                                delay = (base_delay * (2**retry_count)) + (
+                                    random.uniform(0, 10)
+                                )
+                                logger.warning(
+                                    f"Concurrent runs exceeded for job {job_name}. "
+                                    f"Attempt {retry_count + 1}/{max_retries}. "
+                                    f"Retrying in {delay:.1f} seconds..."
+                                )
+                                time.sleep(delay)
+                                retry_count += 1
+                            else:
+                                raise RuntimeError(
+                                    f"Maximum retries ({max_retries}) reached while waiting "
+                                    f"for concurrent jobs to complete. Job: {job_name}"
+                                ) from e
+                        else:
+                            raise
 
                 output_path = job_params["script_args"].get("--output_path", "")
                 logger.info(
-                    f"Glue job {job_name} completed. Output path: {output_path}"
+                    f"Glue job {job_name} completed successfully. Output path: {output_path}"
                 )
                 return output_path
 
@@ -311,33 +354,51 @@ def music_streaming_pipeline():
                 logger.error(
                     f"Error executing Glue job {job_name}: {str(e)}", exc_info=True
                 )
-                raise
+
+                # Try to get job run details if available
+                try:
+                    runs = glue_client.get_job_runs(JobName=job_name, MaxResults=1)
+                    if runs["JobRuns"]:
+                        last_run = runs["JobRuns"][0]
+                        logger.error(
+                            f"Last job run details: State={last_run['JobRunState']}, "
+                            f"Error={last_run.get('ErrorMessage', 'No error message')}"
+                        )
+                except Exception as detail_error:
+                    logger.error(f"Failed to get job run details: {str(detail_error)}")
+
+                raise RuntimeError(f"Glue job failed: {str(e)}") from e
 
     # Define the task flow
     logger.info("Setting up pipeline task flow")
 
-    input_file = check_for_data(bucket=S3_BUCKET, prefix=S3_RAW_PREFIX)
+    # Define sensor task
+    check_data = check_for_data.override(task_id="check_for_data")(
+        bucket=S3_BUCKET, prefix=S3_RAW_PREFIX
+    )
 
-    # Only proceed if we have a file to process
-    if input_file:
-        logger.info(f"Pipeline triggered for input file: {input_file}")
+    # Define validation task group
+    validation_params = prepare_validation_job(check_data)
+    validation_result = run_glue_job.override(task_id="run_validation_job")(
+        validation_params
+    )
 
-        validation_params = prepare_validation_job(input_file)
-        validated_path = run_glue_job(validation_params)
-        logger.info(f"Data validation completed. Output: {validated_path}")
+    # Define KPI computation task group
+    kpi_params = prepare_kpi_job(validation_result)
+    kpi_result = run_glue_job.override(task_id="run_kpi_job")(kpi_params)
 
-        kpi_params = prepare_kpi_job(validated_path)
-        processed_path = run_glue_job(kpi_params)
-        logger.info(f"KPI computation completed. Output: {processed_path}")
+    # Define DynamoDB load task group
+    dynamodb_params = prepare_dynamodb_job(kpi_result)
+    dynamodb_result = run_glue_job.override(task_id="run_dynamodb_job")(dynamodb_params)
 
-        dynamodb_params = prepare_dynamodb_job(processed_path)
-        run_glue_job(dynamodb_params)
-        logger.info("DynamoDB load completed")
+    # Define archive task
+    archive_result = archive_files(check_data)
 
-        archive_files(input_file)
-        logger.info("Pipeline execution completed successfully")
-    else:
-        logger.info("No new files to process. Ending pipeline execution.")
+    # Set task dependencies
+    check_data >> validation_params
+    validation_result >> kpi_params
+    kpi_result >> dynamodb_params
+    dynamodb_result >> archive_result
 
 
 # Create the DAG
