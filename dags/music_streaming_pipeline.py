@@ -17,23 +17,27 @@ from airflow.decorators import dag, task
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.providers.amazon.aws.operators.glue import GlueJobOperator
 from airflow.exceptions import AirflowException
+from airflow.models.xcom_arg import XComArg
+from airflow.providers.amazon.aws.hooks.base_aws import AwsBaseHook
 
 from constants import (
     AWS_CONN_ID,
     AWS_REGION,
     AWS_GLUE_IAM_ROLE,
+    GLUE_SCRIPT_DYNAMODB,
     GLUE_WORKER_TYPE,
     GLUE_NUM_WORKERS,
     GLUE_TIMEOUT,
     GLUE_MAX_CONCURRENT_RUNS,
     S3_BUCKET,
+    S3_KPIS_PREFIX,
     S3_RAW_PREFIX,
     PROCESSED_FILES_KEY,
     REFERENCE_DATA_STATE_KEY,
     S3_KEY_NOT_FOUND_ERROR,
     S3_VALIDATED_PREFIX,
-    S3_PROCESSED_PREFIX,
     S3_SCRIPTS_PREFIX,
+    S3_ARCHIVED_PREFIX,
     REQUIRED_S3_DIRS,
     GLUE_SCRIPT_VALIDATION,
     GLUE_SCRIPT_KPI,
@@ -46,7 +50,9 @@ from constants import (
     TASK_EMAIL_ON_FAILURE,
     GLUE_JOB_VALIDATION,
     GLUE_JOB_KPI,
+    GLUE_JOB_DYNAMODB,
 )
+from scripts.create_dynamodb_table import create_kpi_table
 
 logger = logging.getLogger(__name__)
 
@@ -260,6 +266,7 @@ def music_streaming_pipeline():
         scripts_to_verify = {
             "validate_data.py": "scripts/validate_data.py",
             "compute_kpis.py": "scripts/compute_kpis.py",
+            "load_dynamodb.py": "scripts/load_dynamodb.py",
         }
 
         for script_name, local_path in scripts_to_verify.items():
@@ -426,6 +433,7 @@ def music_streaming_pipeline():
     def update_processed_files(new_files: List[str]) -> bool:
         """
         Update the record of processed files in S3.
+        Returns True if update was successful, False otherwise.
         """
         if not new_files:
             logger.info("No new files to record")
@@ -441,7 +449,8 @@ def music_streaming_pipeline():
                 if "Not Found" in str(e) or S3_KEY_NOT_FOUND_ERROR in str(e):
                     processed_files = {}
                 else:
-                    raise
+                    logger.error(f"Error reading processed files: {str(e)}")
+                    return False
 
             # Update with new files
             timestamp = datetime.now().isoformat()
@@ -452,12 +461,16 @@ def music_streaming_pipeline():
                 }
 
             # Write back to S3
-            s3_hook.load_string(
-                string_data=json.dumps(processed_files, indent=2),
-                key=PROCESSED_FILES_KEY,
-                bucket_name=S3_BUCKET,
-                replace=True,
-            )
+            try:
+                s3_hook.load_string(
+                    string_data=json.dumps(processed_files, indent=2),
+                    key=PROCESSED_FILES_KEY,
+                    bucket_name=S3_BUCKET,
+                    replace=True,
+                )
+            except Exception as e:
+                logger.error(f"Failed to write processed files record: {str(e)}")
+                return False
 
             logger.info(
                 f"Successfully updated processed files record with {len(new_files)} new files"
@@ -466,9 +479,7 @@ def music_streaming_pipeline():
 
         except Exception as e:
             logger.error(f"Failed to update processed files record: {str(e)}")
-            raise AirflowException(
-                f"Failed to update processed files record: {str(e)}"
-            ) from e
+            return False
 
     def clean_s3_path(path: str) -> str:
         """Clean S3 path by removing extra slashes and ensuring proper format"""
@@ -498,7 +509,7 @@ def music_streaming_pipeline():
 
             # Clean paths
             cleaned_validated_path = clean_s3_path(validated_path)
-            output_path = clean_s3_path(f"s3://{S3_BUCKET}/{S3_PROCESSED_PREFIX}")
+            output_path = clean_s3_path(f"s3://{S3_BUCKET}/{S3_KPIS_PREFIX}")
 
             # Check for required files
             required_files = {
@@ -575,22 +586,60 @@ def music_streaming_pipeline():
             logger.exception("Full traceback:")
             return None
 
-    # @task
-    # def prepare_dynamodb_job(kpi_path: str | None) -> Dict | None:
-    #     """Prepare DynamoDB load job parameters"""
-    #     if not kpi_path:
-    #         logger.info("No KPI path provided - skipping DynamoDB load")
-    #         return None
+    @task
+    def prepare_dynamodb_job(kpi_path: str | None) -> Dict | None:
+        """
+        Prepare DynamoDB load job parameters
 
-    #     return {
-    #         "job_name": "streaming_dynamodb_load",
-    #         "script_location": GLUE_SCRIPT_DYNAMODB,
-    #         "script_args": {
-    #             "--input_path": kpi_path,  # Make sure this is included
-    #             "--table_name": "music_streaming_kpis",
-    #             "--kpi_types": "user,genre,trending",
-    #         },
-    #     }
+        Args:
+            kpi_path: S3 path containing KPI data
+
+        Returns:
+            Dict containing Glue job parameters or None if no data to process
+        """
+        if not kpi_path:
+            logger.info("No KPI path provided - skipping DynamoDB load")
+            return None
+
+        try:
+            # Verify KPI data exists
+            s3_hook = S3Hook(aws_conn_id=AWS_CONN_ID)
+            kpi_prefix = kpi_path.replace(f"s3://{S3_BUCKET}/", "").rstrip("/")
+
+            required_folders = [
+                "user_kpis",
+                "genre_daily_metrics_kpi",
+                "genre_top_songs_kpi",
+                "genre_top_genres_kpi",
+                "trending_kpis",
+            ]
+            missing_folders = []
+
+            for folder in required_folders:
+                folder_path = f"{kpi_prefix}/{folder}"
+                if not s3_hook.check_for_prefix(
+                    bucket_name=S3_BUCKET, prefix=folder_path, delimiter="/"
+                ):
+                    missing_folders.append(folder)
+
+            if missing_folders:
+                logger.error(f"Missing KPI folders: {missing_folders}")
+                return None
+
+            return {
+                "job_name": GLUE_JOB_DYNAMODB,
+                "script_location": GLUE_SCRIPT_DYNAMODB,
+                "script_args": {
+                    "--input_path": kpi_path,
+                    "--table_name": "music_streaming_kpis",
+                    "--kpi_types": "user,genre,trending",
+                },
+            }
+
+        except Exception as e:
+            logger.error(f"Error preparing DynamoDB job: {str(e)}")
+            logger.exception("Full traceback:")
+            return None
 
     @task
     def run_glue_job(job_params: Dict | None) -> str | None:
@@ -669,36 +718,150 @@ def music_streaming_pipeline():
             logger.exception("Full traceback:")
             raise AirflowException(f"Glue job {job_name} failed: {str(e)}") from e
 
-    # @task
-    # def archive_files(input_path: str | None) -> bool:
-    #     """Archive processed files"""
-    #     if not input_path:
-    #         return False
+    @task
+    def archive_files(input_paths: List[str] | None) -> bool:
+        """
+        Archive processed files to dated folders
 
-    #     try:
-    #         s3_hook = S3Hook(aws_conn_id=AWS_CONN_ID)
-    #         source_key = input_path.replace(f"s3://{S3_BUCKET}/", "")
-    #         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    #         dest_key = f"{S3_ARCHIVED_PREFIX}{timestamp}/{source_key.split('/')[-1]}"
+        Args:
+            input_paths: List of S3 paths to archive
 
-    #         s3_hook.copy_object(
-    #             source_bucket_name=S3_BUCKET,
-    #             source_key=source_key,
-    #             dest_bucket_name=S3_BUCKET,
-    #             dest_key=dest_key,
-    #         )
+        Returns:
+            bool: True if archiving successful
+        """
+        if not input_paths:
+            logger.info("No paths to archive")
+            return False
 
-    #         logger.info(f"Archived {source_key} to {dest_key}")
-    #         return True
-    #     except Exception as e:
-    #         logger.error(f"Failed to archive file: {str(e)}")
-    #         raise
+        try:
+            s3_hook = S3Hook(aws_conn_id=AWS_CONN_ID)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            archived = []
+
+            for input_path in input_paths:
+                if not input_path:
+                    continue
+
+                # Remove bucket prefix if present
+                source_key = input_path.replace(f"s3://{S3_BUCKET}/", "")
+
+                # List all objects under the prefix
+                objects = s3_hook.list_keys(bucket_name=S3_BUCKET, prefix=source_key)
+
+                if not objects:
+                    logger.warning(f"No objects found at path: {source_key}")
+                    continue
+
+                for obj_key in objects:
+                    if obj_key.endswith("/"):  # Skip directories
+                        continue
+
+                    # Create archive path maintaining folder structure
+                    relative_path = obj_key.replace(source_key, "").lstrip("/")
+                    dest_key = f"{S3_ARCHIVED_PREFIX}{timestamp}/{relative_path}"
+
+                    try:
+                        # Copy to archive
+                        s3_hook.copy_object(
+                            source_bucket_name=S3_BUCKET,
+                            source_key=obj_key,
+                            dest_bucket_name=S3_BUCKET,
+                            dest_key=dest_key,
+                        )
+                        archived.append(obj_key)
+
+                        # Delete original after successful copy
+                        s3_hook.delete_objects(bucket=S3_BUCKET, keys=[obj_key])
+
+                    except Exception as e:
+                        logger.error(f"Failed to archive {obj_key}: {str(e)}")
+                        raise AirflowException(
+                            f"Failed to archive files: {str(e)}"
+                        ) from e
+
+            logger.info(
+                f"Successfully archived {len(archived)} files to {S3_ARCHIVED_PREFIX}{timestamp}/"
+            )
+            return True
+
+        except Exception as e:
+            logger.error(f"Archive operation failed: {str(e)}")
+            raise AirflowException(f"Failed to archive files: {str(e)}") from e
+
+    @task
+    def archive_processed_data(
+        validated_path: str | None, kpi_path: str | None
+    ) -> bool:
+        """
+        Archive validated and processed data
+
+        Args:
+            validated_path: Path to validated data
+            kpi_path: Path to KPI data
+
+        Returns:
+            bool: True if archiving successful
+        """
+        # Resolve XCom references if they exist
+        if isinstance(validated_path, XComArg):
+            validated_path = validated_path.resolve()
+        if isinstance(kpi_path, XComArg):
+            kpi_path = kpi_path.resolve()
+
+        paths_to_archive = []
+
+        if validated_path:
+            paths_to_archive.append(validated_path)
+        if kpi_path:
+            paths_to_archive.append(kpi_path)
+
+        if not paths_to_archive:
+            logger.info("No paths to archive")
+            return False
+
+        try:
+            logger.info(f"Archiving paths: {paths_to_archive}")
+            result = archive_files(paths_to_archive)
+            return bool(result)  # Ensure we return a boolean
+        except Exception as e:
+            logger.error(f"Failed to archive files: {str(e)}")
+            return False
+
+    @task
+    def ensure_dynamodb_table() -> bool:
+        """
+        Ensure DynamoDB table exists using existing create_kpi_table function
+
+        Returns:
+            bool: True if table exists or was created successfully
+        """
+        try:
+            table_name = "music_streaming_kpis"
+
+            # Get AWS credentials from Airflow connection
+            aws_hook = AwsBaseHook(aws_conn_id=AWS_CONN_ID, client_type="dynamodb")
+            credentials = aws_hook.get_credentials()
+
+            logger.info(f"Ensuring DynamoDB table exists: {table_name}")
+            create_kpi_table(
+                table_name=table_name,
+                region=AWS_REGION,
+                aws_access_key_id=credentials.access_key,
+                aws_secret_access_key=credentials.secret_key,
+                aws_session_token=credentials.token,
+            )
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to ensure DynamoDB table exists: {str(e)}")
+            return False
 
     # Initialize S3 structure first
     validate_conn = validate_aws_connection()
     cleanup_task = cleanup_s3_scripts()
     init_task = init_s3_structure()
     verify_scripts = verify_glue_scripts()
+    ensure_table = ensure_dynamodb_table()  # Uses existing create_kpi_table function
 
     # Set up dependencies for initialization
     validate_conn >> cleanup_task >> init_task >> verify_scripts
@@ -716,13 +879,17 @@ def music_streaming_pipeline():
     kpi_path = run_glue_job(kpi_params)
 
     # Load to DynamoDB
-    # dynamodb_params = prepare_dynamodb_job(kpi_path)
-    # dynamodb_result = run_glue_job(dynamodb_params)
+    dynamodb_params = prepare_dynamodb_job(kpi_path)
+    dynamodb_result = run_glue_job(dynamodb_params)
+
+    # Archive processed data
+    archive_result = archive_processed_data(validated_path, kpi_path)
 
     # Update processed files record
     update_result = update_processed_files(new_streams)
 
-    # Set dependencies
+    # Set up the complete task dependencies
+
     (
         validate_conn
         >> cleanup_task
@@ -734,13 +901,12 @@ def music_streaming_pipeline():
         >> validated_path
         >> kpi_params
         >> kpi_path
+        >> [dynamodb_params, ensure_table]
+        >> dynamodb_result
+        >> archive_result
         >> update_result
     )
 
 
 # Create the DAG
 dag = music_streaming_pipeline()
-
-
-# Create the DAG
-# dag = music_streaming_pipeline()

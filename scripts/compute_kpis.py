@@ -5,12 +5,15 @@ from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql.functions import (
     col,
     count,
+    lit,
     sum,
     avg,
+    max,
     to_timestamp,
     countDistinct,
     date_trunc,
     dense_rank,
+    unix_timestamp,
 )
 from pyspark.sql import Window
 from awsglue.utils import getResolvedOptions
@@ -152,22 +155,40 @@ def read_parquet_safely(spark: SparkSession, path: str, name: str) -> DataFrame:
 
 
 def compute_user_kpis(df: DataFrame) -> DataFrame:
-    """Compute user-level KPIs"""
-    logger.info("Computing user KPIs")
-    return df.groupBy("user_id", "user_name", "user_country").agg(
-        count("track_id").alias("total_songs_played"),
-        sum("listening_time").alias("total_listening_time_minutes"),
-        avg("listening_time").alias("avg_listening_time_minutes"),
+    """
+    Compute user-level KPIs.
+
+    Args:
+        df: Enriched streaming DataFrame
+
+    Returns:
+        DataFrame: User-level KPI metrics
+    """
+    return (
+        df.groupBy("user_id", "user_name", "user_country")
+        .agg(
+            count("track_id").alias("total_songs_played"),
+            sum("listening_time").alias("total_listening_time_minutes"),
+            avg("listening_time").alias("avg_listening_time_minutes"),
+        )
+        .withColumn("kpi_type", lit("user"))
     )
 
 
 def compute_genre_kpis(df: DataFrame) -> dict:
-    """Compute genre-level KPIs"""
-    logger.info("Computing genre KPIs")
+    """
+    Compute genre-level KPIs.
+
+    Args:
+        df: Enriched streaming DataFrame
+
+    Returns:
+        dict: Genre-level KPI metrics
+    """
 
     daily_df = df.withColumn("date", date_trunc("day", col("timestamp")))
 
-    daily_metrics = daily_df.groupBy("date", "track_genre").agg(
+    daily_metrics_kpi = daily_df.groupBy("date", "track_genre").agg(
         count("track_id").alias("listen_count"),
         countDistinct("user_id").alias("unique_listeners"),
         sum("listening_time").alias("total_listening_time_minutes"),
@@ -176,7 +197,7 @@ def compute_genre_kpis(df: DataFrame) -> dict:
     window_genre = Window.partitionBy("date", "track_genre").orderBy(
         col("play_count").desc()
     )
-    top_songs = (
+    top_songs_kpi = (
         daily_df.groupBy("date", "track_genre", "track_id")
         .agg(count("*").alias("play_count"))
         .withColumn("rank", dense_rank().over(window_genre))
@@ -184,15 +205,48 @@ def compute_genre_kpis(df: DataFrame) -> dict:
     )
 
     window_day = Window.partitionBy("date").orderBy(col("listen_count").desc())
-    top_genres = daily_metrics.withColumn("rank", dense_rank().over(window_day)).filter(
-        col("rank") <= TOP_GENRES_PER_DAY
-    )
+    top_genres_kpi = daily_metrics_kpi.withColumn(
+        "rank", dense_rank().over(window_day)
+    ).filter(col("rank") <= TOP_GENRES_PER_DAY)
 
     return {
-        "daily_metrics": daily_metrics,
-        "top_songs": top_songs,
-        "top_genres": top_genres,
+        "daily_metrics_kpi": daily_metrics_kpi,
+        "top_songs_kpi": top_songs_kpi,
+        "top_genres_kpi": top_genres_kpi,
     }
+
+
+def compute_trending_songs(df: DataFrame) -> DataFrame:
+    """
+    Compute trending songs based on last 24 hours.
+
+    Args:
+        df: Enriched streaming DataFrame
+
+    Returns:
+        DataFrame: Trending songs metrics
+    """
+    # Convert timestamp to Unix timestamp (seconds since epoch)
+    df = df.withColumn("unix_timestamp", unix_timestamp(col("timestamp")))
+
+    window_spec = (
+        Window.partitionBy("track_id")
+        .orderBy(col("unix_timestamp").desc())  # Order by Unix timestamp
+        .rangeBetween(-24 * 60 * 60, 0)  # Range in seconds
+    )
+
+    return (
+        df.withColumn("plays_last_24h", count("track_id").over(window_spec))
+        .groupBy("track_id", "track_genre")
+        .agg(
+            max("plays_last_24h").alias("plays_last_24h"),  # Use pyspark_max here
+            sum("listening_time").alias("total_listening_time_minutes"),
+            # Use approx_count_distinct or countDistinct directly
+            countDistinct("user_id").alias("unique_listeners"),  # Changed this line
+        )
+        .orderBy(col("plays_last_24h").desc())
+        .withColumn("kpi_type", lit("trending"))
+    )
 
 
 def prepare_streaming_data(
@@ -290,15 +344,24 @@ def main():
         # Compute KPIs
         user_kpis = compute_user_kpis(enriched_df)
         genre_kpis = compute_genre_kpis(enriched_df)
+        trending_kpis = compute_trending_songs(enriched_df)
 
         # Save results
         output_path = clean_s3_path(args["output_path"])
         write_parquet_safely(user_kpis, f"{output_path}/user_kpis", "user KPIs")
 
+        write_parquet_safely(
+            trending_kpis, f"{output_path}/trending_kpis", "trending KPIs"
+        )
+
         for kpi_name, df in genre_kpis.items():
             write_parquet_safely(
                 df, f"{output_path}/genre_{kpi_name}", f"genre {kpi_name}"
             )
+            logger.info(f"Saved genre {kpi_name} KPIs")
+            logger.info(f"- Genre {kpi_name}: {df.count()} records")
+
+            logger.info(df.show(5))
 
         logger.info("KPI computation completed successfully")
 

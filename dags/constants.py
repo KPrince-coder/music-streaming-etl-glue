@@ -16,6 +16,7 @@ S3_VALIDATED_PREFIX = "validated/"
 S3_PROCESSED_PREFIX = "processed/"
 S3_ARCHIVED_PREFIX = "archived/"
 S3_SCRIPTS_PREFIX = "scripts/"
+S3_KPIS_PREFIX = "kpis/"
 
 # File paths
 PROCESSED_FILES_KEY = f"{S3_PROCESSED_PREFIX}processed_streams.json"
@@ -28,6 +29,7 @@ REQUIRED_S3_DIRS = [
     S3_PROCESSED_PREFIX,
     S3_ARCHIVED_PREFIX,
     S3_SCRIPTS_PREFIX,
+    S3_KPIS_PREFIX,
 ]
 
 # Glue Job Names
