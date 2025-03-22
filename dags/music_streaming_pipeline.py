@@ -738,6 +738,17 @@ def music_streaming_pipeline():
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             archived = []
 
+            # List raw files to archive
+            raw_files = s3_hook.list_keys(bucket_name=S3_BUCKET, prefix=S3_RAW_PREFIX)
+
+            # Filter out directory markers and empty strings
+            raw_files = [f for f in raw_files if f and not f.endswith("/")]
+
+            # Add raw files to input paths for archiving
+            if raw_files:
+                input_paths.append(f"s3://{S3_BUCKET}/{S3_RAW_PREFIX}")
+                logger.info(f"Found {len(raw_files)} raw files to archive")
+
             for input_path in input_paths:
                 if not input_path:
                     continue
@@ -756,11 +767,23 @@ def music_streaming_pipeline():
                     if obj_key.endswith("/"):  # Skip directories
                         continue
 
-                    # Create archive path maintaining folder structure
-                    relative_path = obj_key.replace(source_key, "").lstrip("/")
-                    dest_key = f"{S3_ARCHIVED_PREFIX}{timestamp}/{relative_path}"
-
                     try:
+                        # Determine the source directory type (raw, validated, or kpis)
+                        if obj_key.startswith(S3_RAW_PREFIX):
+                            source_type = "raw"
+                        elif obj_key.startswith(S3_VALIDATED_PREFIX):
+                            source_type = "validated"
+                        elif obj_key.startswith(S3_KPIS_PREFIX):
+                            source_type = "kpis"
+                        else:
+                            source_type = "other"
+
+                        # Create archive path maintaining folder structure
+                        relative_path = obj_key.replace(source_key, "").lstrip("/")
+                        dest_key = f"{S3_ARCHIVED_PREFIX}{timestamp}/{source_type}/{relative_path}"
+
+                        logger.info(f"Archiving {obj_key} to {dest_key}")
+
                         # Copy to archive
                         s3_hook.copy_object(
                             source_bucket_name=S3_BUCKET,
@@ -772,6 +795,7 @@ def music_streaming_pipeline():
 
                         # Delete original after successful copy
                         s3_hook.delete_objects(bucket=S3_BUCKET, keys=[obj_key])
+                        logger.info(f"Successfully archived and deleted: {obj_key}")
 
                     except Exception as e:
                         logger.error(f"Failed to archive {obj_key}: {str(e)}")
@@ -810,10 +834,15 @@ def music_streaming_pipeline():
 
         paths_to_archive = []
 
+        # Add validated data path
         if validated_path:
             paths_to_archive.append(validated_path)
+
+        # Add KPI data path
         if kpi_path:
             paths_to_archive.append(kpi_path)
+
+        # Raw files will be handled within archive_files function
 
         if not paths_to_archive:
             logger.info("No paths to archive")
